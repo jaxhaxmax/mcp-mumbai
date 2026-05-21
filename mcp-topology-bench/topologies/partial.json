@@ -1,0 +1,11 @@
+{
+  "schema_version": "0.1.0",
+  "topology": {
+    "termination": {
+      "max_delegation_depth": 3,
+      "max_turns": 3,
+      "authority": "orchestrator",
+      "on_limit_reached": "return_partial_with_flag"
+    }
+  }
+}

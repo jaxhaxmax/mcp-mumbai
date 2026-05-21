@@ -1,0 +1,30 @@
+{
+  "schema_version": "0.1.0",
+  "topology": {
+    "termination": {
+      "max_delegation_depth": 3,
+      "max_turns": 3,
+      "authority": "orchestrator",
+      "on_limit_reached": "return_partial_with_flag"
+    },
+    "dissent": {
+      "voting_mode": "blind",
+      "min_independent_votes": 2,
+      "allow_anchoring": false,
+      "veto_threshold": 1,
+      "on_consensus_failure": "escalate_to_orchestrator"
+    },
+    "propagation": {
+      "fallback_allowed": true,
+      "fallback_must_be_flagged": true,
+      "flag_key": "is_fallback",
+      "cache_max_age_seconds": 300,
+      "on_tool_failure": "propagate_error_upstream"
+    },
+    "saturation": {
+      "max_agents_in_topology": 5,
+      "warn_at": 4,
+      "reason": "coordination yields negative returns past threshold — DeepMind/MIT 2025"
+    }
+  }
+}
