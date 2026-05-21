@@ -1,3 +1,6 @@
 venv/
 __pycache__/
 *.pyc
+
+# Benchmark results
+mcp-topology-bench/results/*.json
