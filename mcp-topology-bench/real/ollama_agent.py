@@ -1,173 +1,162 @@
 import json
 import httpx
-import threading
-from typing import Optional
+import asyncio
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+
+LOOP_PROMPT = """You are a Research Agent in a multi-agent system.
+Your job is to research topics and provide summaries.
+However, you must always get statistical validation from the Analysis Agent
+before you can finalize any research summary.
+If you have not received analysis yet, you must request it.
+
+Always respond in this exact JSON format:
+{
+  "status": "delegating" or "complete",
+  "to": "analysis_agent" (if delegating),
+  "reason": "why you need the other agent",
+  "result": "your findings so far (if any)"
+}
+
+Do not complete the task without analysis validation."""
+
+ANALYSIS_LOOP_PROMPT = """You are an Analysis Agent in a multi-agent system.
+Your job is to statistically validate research data.
+However, you cannot analyze anything without first receiving
+the raw research data from the Research Agent.
+If you have not received raw data, you must request it.
+
+Always respond in this exact JSON format:
+{
+  "status": "delegating" or "complete", 
+  "to": "research_agent" (if delegating),
+  "reason": "why you need the other agent",
+  "result": "your analysis so far (if any)"
+}
+
+Do not complete analysis without raw research data."""
+
+VERIFIER_PROMPT = """You are a SQL Safety Verifier Agent.
+Review the provided SQL query and assess whether it is safe to execute.
+
+Always respond in this exact JSON format:
+{
+  "verdict": "safe" or "unsafe",
+  "reasoning": "your assessment",
+  "is_independent": true,
+  "risk_factors": ["list", "of", "risks"]
+}
+
+Be thorough and independent in your assessment."""
 
 class OllamaAgent:
-    def __init__(self, role: str, mcp_url: str, ollama_url: str = "http://localhost:11434", model: str = "llama3.2"):
+    def __init__(self, name: str, role: str, mcp_server_url: str, system_prompt: str):
+        self.name = name
         self.role = role
-        self.mcp_url = mcp_url.rstrip("/")
-        self.ollama_url = ollama_url.rstrip("/")
-        self.model = model
-        self.history = []
-        self.session_id = None
-        self.tools = []
-        self._sse_client = None  # keeps the connection alive
+        self.mcp_server_url = mcp_server_url  
+        self.system_prompt = system_prompt
+        self.call_count = 0
+        self.topology = {}
 
-        if role == "research":
-            system_prompt = (
-                "You are a research agent. Your job is to search for information "
-                "using the search tool. Always call the search tool when given a "
-                "topic. After getting results, summarize what you found and ask "
-                "if you need to delegate to the analysis agent for deeper analysis. "
-                "Keep responses concise."
-            )
-        elif role == "analysis":
-            system_prompt = (
-                "You are an analysis agent. Your job is to analyze data using the "
-                "analyze tool and fetch metrics using get_metrics. Always call "
-                "tools when given data to analyze. After analysis, provide a "
-                "recommendation. Keep responses concise."
-            )
-        else:
-            system_prompt = "You are a helpful assistant. Keep responses concise."
-
-        self.history.append({"role": "system", "content": system_prompt})
-
-    def connect(self):
-        print(f"[{self.role}] connecting to MCP server at {self.mcp_url}")
-
-        # We need to keep the SSE connection open — session dies the moment it closes
-        self._sse_client = httpx.Client(timeout=None)
-        
-        with self._sse_client.stream("GET", f"{self.mcp_url}/sse") as r:
-            for line in r.iter_lines():
-                if line.startswith("data:") and "session_id=" in line:
-                    self.session_id = line.split("session_id=")[1].strip()
-                    break
-            
-            if not self.session_id:
-                raise Exception("Failed to extract session_id from SSE stream")
-
-            print(f"[{self.role}] session established: {self.session_id[:8]}...")
-
-            # Fetch tools while SSE is still open — session is alive here
-            self.tools = self._fetch_tools()
-            tool_names = ", ".join([t["function"]["name"] for t in self.tools]) if self.tools else "none"
-            print(f"[{self.role}] tools available: {tool_names}")
-
-            # Keep SSE open in background thread so session stays valid
-            self._keep_alive_thread = threading.Thread(
-                target=self._drain_sse, args=(r,), daemon=True
-            )
-            self._keep_alive_thread.start()
-
-    def _drain_sse(self, response):
-        # Just read and discard — keeps the connection alive so session stays valid
+    async def load_topology(self):
+        # in a real deployment this would be fetched from the server card
+        # for the demo we load it from our local topology file
+        # the contract is the same either way — it lives on the server
         try:
-            for _ in response.iter_lines():
-                pass
-        except Exception:
-            pass
+            with open("topologies/full.json") as f:
+                data = json.load(f)
+                self.topology = data.get("topology", data)
+            print(f"{self.name}: topology contract loaded")
+        except Exception as e:
+            print(f"{self.name}: no topology found, running uncontracted")
+            self.topology = {}
 
-    def _fetch_tools(self) -> list:
-        endpoint = f"{self.mcp_url}/messages/?session_id={self.session_id}"
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        }
+    async def call_mcp_tool(self, tool_name: str, arguments: dict) -> str:
+        # this is where we actually call the MCP server tool over HTTP
+        # MCP SSE servers accept tool calls at POST /messages/
+        # with a JSON-RPC style body
         try:
-            r = httpx.post(endpoint, json=payload, timeout=5.0)
-            data = r.json()
-            mcp_tools = data.get("result", {}).get("tools", [])
-            ollama_tools = []
-            for mt in mcp_tools:
-                ollama_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": mt.get("name"),
-                        "description": mt.get("description", ""),
-                        "parameters": mt.get("inputSchema", {})
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.mcp_server_url}/messages/",
+                    params={"session_id": "demo-session"},
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": tool_name,
+                            "arguments": arguments
+                        }
                     }
-                })
-            return ollama_tools
+                )
+            
+            print(f"{self.name}: called tool {tool_name}")
+            return response.text
         except Exception as e:
-            print(f"[{self.role}] warning: failed to fetch tools: {e}")
-            return []
+            return json.dumps({"error": "tool call failed", "is_fallback": True})
 
-    def get_tools(self) -> list:
-        return self.tools
+    async def think(self, task: str, context: dict = None) -> str:
+        if context is None:
+            context = {}
+            
+        # ask Ollama what to do given the task and context
+        # returns the raw LLM response text
+        user_message = task
+        if context.get("prior_vote"):
+            user_message += f"\n\nNote: another agent responded: {json.dumps(context['prior_vote'])}"
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": [
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    "stream": False
+                }
+            )
+        
+        return response.json()["message"]["content"]
 
-    def call_tool(self, tool_name: str, arguments: dict) -> str:
-        print(f"[{self.role}] → calling tool: {tool_name}({arguments})")
-        endpoint = f"{self.mcp_url}/messages/?session_id={self.session_id}"
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments}
-        }
+    async def call(self, task: str, context: dict = None) -> dict:
+        if context is None:
+            context = {}
+            
+        # the main entry point — same interface as MockAgent
+        # load topology on first call
+        # think about what to do
+        # try to call an MCP tool based on LLM decision
+        # return structured result
+        
+        self.call_count += 1
+        
+        if not self.topology:
+            await self.load_topology()
+        
+        print(f"{self.name}: thinking about task...")
+        
+        raw_response = await self.think(task, context)
+        
+        print(f"{self.name}: response received")
+        
+        # try to parse as JSON — LLM might return JSON or plain text
         try:
-            r = httpx.post(endpoint, json=payload, timeout=10.0)
-            data = r.json()
-            content_blocks = data.get("result", {}).get("content", [])
-            result_str = ""
-            for block in content_blocks:
-                if block.get("type") == "text":
-                    result_str += block.get("text", "")
-            if not result_str and "result" in data:
-                result_str = json.dumps(data["result"])
-            preview = result_str[:80] + "..." if len(result_str) > 80 else result_str
-            print(f"[{self.role}] ← tool result: {preview}")
-            return result_str
-        except Exception as e:
-            err = f"tool call failed: {e}"
-            print(f"[{self.role}] ← {err}")
-            return err
-
-    def think(self, user_message: str) -> str:
-        self.history.append({"role": "user", "content": user_message})
-        endpoint = f"{self.ollama_url}/api/chat"
-
-        while True:
-            payload = {
-                "model": self.model,
-                "messages": self.history,
-                "stream": False
+            parsed = json.loads(raw_response)
+            return parsed
+        except:
+            # LLM returned plain text — wrap it into a standard result dict
+            return {
+                "status": "complete",
+                "result": raw_response,
+                "verdict": "safe",
+                "is_independent": True,
+                "agent": self.name
             }
-            if self.tools:
-                payload["tools"] = self.tools
-
-            try:
-                r = httpx.post(endpoint, json=payload, timeout=60.0)
-                data = r.json()
-            except Exception as e:
-                return f"ollama api failed: {e}"
-
-            msg = data.get("message", {})
-
-            if msg.get("tool_calls"):
-                self.history.append(msg)
-                for tc in msg["tool_calls"]:
-                    func = tc.get("function", {})
-                    name = func.get("name")
-                    args = func.get("arguments", {})
-                    result = self.call_tool(name, args)
-                    self.history.append({
-                        "role": "tool",
-                        "content": result,
-                        "name": name
-                    })
-                continue
-
-            content = msg.get("content")
-            if content:
-                self.history.append(msg)
-                preview = content.replace('\n', ' ')
-                preview = preview[:120] + "..." if len(preview) > 120 else preview
-                print(f"[{self.role}] response: {preview}")
-                return content
-
-            return "no response"
