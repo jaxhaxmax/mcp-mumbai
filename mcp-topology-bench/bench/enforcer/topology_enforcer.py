@@ -69,7 +69,7 @@ class TopologyEnforcer:
                     "consensus": False,
                     "action": "escalate",
                     "verdicts": verdicts,
-                    "independent_vote_count": len(votes),  # total agents polled
+                    "independent_vote_count": independent_count,
                     "message": "dissent detected — escalating to orchestrator"
                 }
             
@@ -79,7 +79,7 @@ class TopologyEnforcer:
                     "consensus": False,
                     "action": "escalate",
                     "verdicts": verdicts,
-                    "independent_vote_count": len(votes),
+                    "independent_vote_count": independent_count,
                     "message": f"only {independent_count} independent votes, need {min_ind} — escalating"
                 }
             
